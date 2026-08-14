@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:3456" />
+  <title>基金追踪 · FundTracker</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📈</span>
+      <h1>基金追踪</h1>
+      <span id="market-status" class="badge">--</span>
+    </div>
+    <div class="topbar-actions">
+      <button id="btn-refresh" class="btn">刷新净值</button>
+      <span id="updated-at" class="muted"></span>
+    </div>
+  </header>
+
+  <!-- 资产统计概览（紧凑版：主卡一行 + 极薄平台分布条） -->
+  <section class="stats">
+    <div class="stat-card card total">
+      <div class="stat-main">
+        <div class="stat-block stat-total">
+          <div class="stat-label">总资产估值(元)</div>
+          <div id="ov-market-value" class="stat-value">--</div>
+          <div class="stat-sub">
+            <span>当日 <b id="ov-day-pnl">--</b></span>
+            <span class="stat-dot">·</span>
+            <span>持仓收益 <b id="ov-profit">--</b></span>
+          </div>
+        </div>
+        <div class="stat-sep"></div>
+        <div class="stat-block">
+          <div class="stat-label">当日涨跌幅</div>
+          <div id="ov-day-pct" class="stat-value sm">--</div>
+        </div>
+        <div class="stat-sep"></div>
+        <div class="stat-block">
+          <div class="stat-label">持仓成本(元)</div>
+          <div id="ov-cost" class="stat-value sm">--</div>
+        </div>
+        <div class="stat-sep"></div>
+        <div class="stat-block">
+          <div class="stat-label">累计收益率</div>
+          <div id="ov-profit-pct" class="stat-value sm">--</div>
+        </div>
+      </div>
+
+      <div class="stat-divider"></div>
+
+      <div class="stat-platforms">
+        <div class="ps-top">
+          <span class="ps-label">平台分布 <span class="ps-hint">· 点击看当日盈亏构成</span></span>
+          <div class="ps-bar" id="ps-bar" role="img" aria-label="各平台市值占比（可点击筛选）"></div>
+        </div>
+        <div class="ps-legend" id="ps-legend"></div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="holdings">持仓概览</button>
+    <button class="tab" data-tab="screenshot">截图更新</button>
+    <button class="tab" data-tab="funds">基金/持仓管理</button>
+    <button class="tab" data-tab="transactions">交易记录</button>
+  </nav>
+
+  <main>
+    <!-- 持仓概览 -->
+    <section id="tab-holdings" class="tab-panel active">
+      <div class="holdings-controls">
+        <div id="type-filter" class="type-filter"></div>
+        <span id="platform-filter" class="platform-filter"></span>
+        <label class="group-toggle"><input type="checkbox" id="group-by-type" /> 按类型分组</label>
+      </div>
+      <table class="grid">
+        <thead>
+          <tr>
+            <th>基金</th><th>代码</th><th>平台</th><th>持有份额</th><th>最新净值</th>
+            <th>估算净值</th><th>估算涨跌</th><th>市值(元)</th><th>累计盈亏</th><th>昨日收益</th><th>当日盈亏</th><th>累计收益(元)</th><th>累计收益率</th><th>明细</th>
+          </tr>
+        </thead>
+        <tbody id="holdings-body"></tbody>
+      </table>
+      <div id="fund-detail" class="detail hidden"></div>
+    </section>
+
+    <!-- 截图更新 -->
+    <section id="tab-screenshot" class="tab-panel">
+      <div class="form-row">
+        <label>平台
+          <select id="scr-platform">
+            <option value="alipay">支付宝</option>
+            <option value="jd">京东金融</option>
+            <option value="licaitong">腾讯理财通</option>
+          </select>
+        </label>
+        <label>类型
+          <select id="scr-kind">
+            <option value="holding">持仓截图</option>
+            <option value="trade">交易截图</option>
+          </select>
+        </label>
+        <input type="file" id="scr-file" accept="image/*" />
+        <button id="btn-ocr" class="btn">识别</button>
+      </div>
+      <div id="ocr-status" class="muted"></div>
+      <div id="ocr-result" class="ocr-result hidden"></div>
+    </section>
+
+    <!-- 基金/持仓管理 -->
+    <section id="tab-funds" class="tab-panel">
+      <div class="form-row">
+        <input type="text" id="fund-code" placeholder="基金代码, 如 110011" />
+        <button id="btn-add-fund" class="btn">添加并拉取持仓</button>
+        <span class="muted">添加后自动从公共接口拉取净值与季报/年报持仓</span>
+      </div>
+      <table class="grid">
+        <thead>
+          <tr><th>基金</th><th>代码</th><th>类型</th><th>平台</th><th>最新净值</th><th>净值日期</th><th>持仓股票数</th><th></th></tr>
+        </thead>
+        <tbody id="funds-body"></tbody>
+      </table>
+    </section>
+
+    <!-- 交易记录 -->
+    <section id="tab-transactions" class="tab-panel">
+      <table class="grid">
+        <thead>
+          <tr><th>基金</th><th>平台</th><th>类型</th><th>金额(元)</th><th>份额</th><th>净值</th><th>日期</th><th>来源</th></tr>
+        </thead>
+        <tbody id="tx-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
