@@ -21,6 +21,7 @@ function pctText(n) {
   return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
 }
 function safeGet(id) { return document.getElementById(id); }
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 /**
  * 渲染"估算涨跌"单元格。
@@ -75,25 +76,69 @@ function platformFilteredFunds() {
   return lastEstimateData.funds.filter((f) => (f.platform || '未标注') === currentPlatformFilter);
 }
 
-async function loadEstimate() {
+// 把一次 estimate 数据渲染到页面(概览 + 持仓 + 平台统计)
+function renderEstimate(data) {
+  const t = data.total;
+  safeGet('ov-market-value').textContent = fmt(t.market_value);
+  setPct('ov-day-pnl', t.day_pnl);
+  setPct('ov-day-pct', t.day_pct, true);
+  safeGet('ov-cost').textContent = fmt(t.cost_amount);
+  setPct('ov-profit', t.total_profit);
+  setPct('ov-profit-pct', t.total_profit_pct, true);
+  safeGet('updated-at').textContent = '更新于 ' + new Date(data.updated_at).toLocaleTimeString('zh-CN');
+  const ms = safeGet('market-status');
+  ms.textContent = data.market_open ? '盘中' : '非交易时段';
+  ms.style.color = data.market_open ? 'var(--down)' : 'var(--muted)';
+  renderHoldings();
+  renderPlatformStats();
+}
+
+function showEstimating(on) {
+  const el = safeGet('est-status');
+  if (el) {
+    el.textContent = on ? '估值更新中…' : '';
+    el.classList.toggle('active', !!on);
+  }
+}
+
+// 前端轮询句柄(避免重复定时器)
+let estPollTimer = null;
+function scheduleEstimatePoll(delay = 1500) {
+  if (estPollTimer) clearTimeout(estPollTimer);
+  estPollTimer = setTimeout(() => { refreshEstimate(); }, delay);
+}
+
+// 首页刷新(异步): GET /estimate 立即返回缓存(毫秒级), 若后台仍在计算则轮询补齐最新值,
+// 这样首屏不用阻塞等待新浪行情, 且 30s 内多次刷新只打一次网络, 规避公共接口限流。
+async function refreshEstimate() {
   try {
     const data = await api('/estimate');
+    // 首帧仍在后台计算(无缓存): 显示"更新中"并轮询等待
+    if (data.computing && (!data.funds || data.funds.length === 0)) {
+      showEstimating(true);
+      scheduleEstimatePoll(2000);
+      return;
+    }
     lastEstimateData = data;
-    const t = data.total;
-    safeGet('ov-market-value').textContent = fmt(t.market_value);
-    setPct('ov-day-pnl', t.day_pnl);
-    setPct('ov-day-pct', t.day_pct, true);
-    safeGet('ov-cost').textContent = fmt(t.cost_amount);
-    setPct('ov-profit', t.total_profit);
-    setPct('ov-profit-pct', t.total_profit_pct, true);
-    safeGet('updated-at').textContent = '更新于 ' + new Date(data.updated_at).toLocaleTimeString('zh-CN');
-    const ms = safeGet('market-status');
-    ms.textContent = data.market_open ? '盘中' : '非交易时段';
-    ms.style.color = data.market_open ? 'var(--down)' : 'var(--muted)';
-    renderHoldings();
-    renderPlatformStats();
+    // 有缓存但后台还在刷新(拿到的是上一帧): 先渲染, 再轮询一次补齐最新
+    if (!data.funds || data.funds.length === 0) {
+      showEstimating(false);
+      safeGet('updated-at').textContent = '暂无估值数据（无持仓或网络异常）';
+      renderHoldings();
+      renderPlatformStats();
+      return;
+    }
+    renderEstimate(data);
+    if (data.computing) {
+      showEstimating(true);
+      scheduleEstimatePoll(1500);
+    } else {
+      showEstimating(false);
+      if (estPollTimer) { clearTimeout(estPollTimer); estPollTimer = null; }
+    }
   } catch (e) {
-    console.error('loadEstimate 失败', e);
+    console.error('refreshEstimate 失败', e);
+    showEstimating(false);
   }
 }
 
@@ -277,6 +322,10 @@ function toggleDetail(f) {
         <tbody>${rows}</tbody>
       </table>`
     : `<p class="muted">暂无持仓股票数据（可在"基金/持仓管理"点单只基金的"刷新"拉取季报持仓）。</p>`;
+  // 未披露仓位用基准指数补齐的说明(估算引擎路径1 的 residual 补齐)
+  const benchmarkLine = (f.intraday_supported !== false && f.residual_ratio != null && f.residual_ratio > 0 && f.index_code)
+    ? `<p class="muted" style="margin-top:10px">季报仅披露合计 <b>${fmt(100 - f.residual_ratio, 1)}%</b> 的持仓；剩余 <b>${fmt(f.residual_ratio, 1)}%</b> 未披露仓位按基准指数 <b>${f.index_code}</b> 当日 <b class="${pctClass(f.benchmark_pct)}">${pctText(f.benchmark_pct)}</b> 补齐，使估算更贴近真实净值。</p>`
+    : '';
   const unsupportedNote = (f.intraday_supported === false)
     ? (f.type === '货币型'
         ? `<p class="muted" style="margin-top:12px">货币基金按日计息、T+1 披露净值，无盘中估值；下方"估算净值"即最新净值${f.nav_date ? `（${f.nav_date}）` : ''}。</p>`
@@ -285,8 +334,9 @@ function toggleDetail(f) {
   box.innerHTML = `
     <h3>${f.name || f.fund_code} (${f.fund_code}) 明细</h3>
     ${summary}
-    <p class="muted">持仓股估算涨跌幅 = Σ(占净值比例 × 成分股实时涨跌幅)，仅含股票仓位，现金/债券近似零波动。</p>
+    <p class="muted">持仓股估算涨跌幅 = Σ(占净值比例 × 成分股实时涨跌幅)；未披露仓位按基准指数当日涨跌补齐。</p>
     ${stockSection}
+    ${benchmarkLine}
     ${unsupportedNote}`;
 }
 
@@ -332,19 +382,20 @@ function renderOcrResult(parsed, platform, kind, file_path) {
     html += '<p class="muted">未在截图中识别出基金代码，请手动录入。</p>';
   } else {
     items.forEach((it, i) => {
-      const hasCode = (isTrade ? it.fund_code : it.code);
+      const hasCode = (isTrade ? (it.fund_code || it.code) : it.code);
       const nameHint = it.name ? ` <span class="muted">(名称: ${escapeHtml(it.name)}</span>${it.name_matched && it.name_matched !== it.name ? ` → 已匹配: ${escapeHtml(it.name_matched)}` : ''}<span class="muted">)</span>` : '';
       const delCls = it.__delete ? ' row-deleted' : '';
       const delBtn = `<button class="btn danger" data-del-i="${i}">${it.__delete ? '恢复' : '删除'}</button>`;
       if (isTrade) {
         html += `<div class="row${delCls}">
           <span>基金${i + 1} 代码</span>
-          <input data-i="${i}" data-f="fund_code" value="${it.fund_code || ''}" />
+          <input data-i="${i}" data-f="fund_code" value="${it.fund_code || it.code || ''}" />
           ${nameHint}
           <button class="btn secondary" data-search-i="${i}">搜代码</button>
           <select data-i="${i}" data-f="type">
             <option value="buy" ${it.type === 'buy' ? 'selected' : ''}>买入</option>
             <option value="sell" ${it.type === 'sell' ? 'selected' : ''}>卖出</option>
+            <option value="dividend" ${it.type === 'dividend' ? 'selected' : ''}>分红</option>
           </select>
           <span>金额</span><input data-i="${i}" data-f="amount" value="${it.amount ?? ''}" />
           <span>份额</span><input data-i="${i}" data-f="shares" value="${it.shares ?? ''}" />
@@ -438,12 +489,17 @@ async function saveOcr(parsed, platform, kind, file_path) {
   try {
     for (const it of items) {
       if (it.__delete) continue; // 已标记删除的识别项不入库
-      const code = kind === 'trade' ? it.fund_code : it.code;
+      const code = kind === 'trade' ? (it.fund_code || it.code) : it.code;
       if (!code) continue; // 无代码的识别项跳过(可在前端修改后保存)
       if (kind === 'trade') {
+        // 先确保 fund 记录存在(便于交易列表显示名称, 离线也能建; 后续 refresh 会补全净值/类型)
+        await api('/funds', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, name: it.name || '', platform }),
+        }).catch(() => {});
         await api('/transactions', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fund_code: it.fund_code, platform, type: it.type, amount: it.amount, shares: it.shares, tx_date: it.date, source: 'screenshot' }),
+          body: JSON.stringify({ fund_code: code, platform, type: it.type, amount: it.amount, shares: it.shares, tx_date: it.date, source: 'screenshot' }),
         });
         try {
           await api('/funds/' + it.fund_code + '/refresh', { method: 'POST' });
@@ -471,7 +527,7 @@ async function saveOcr(parsed, platform, kind, file_path) {
       }
     }
     alert('已保存');
-    loadEstimate(); loadFunds(); loadTransactions();
+    refreshEstimate(); loadFunds(); loadTransactions();
   } catch (e) {
     alert('保存失败: ' + e.message);
   }
@@ -533,7 +589,7 @@ async function loadTransactions() {
       tr.innerHTML = `
         <td>${nameMap[t.fund_code] || '--'} (${t.fund_code})</td>
         <td>${t.platform || '--'}</td>
-        <td>${t.type === 'buy' ? '买入' : t.type === 'sell' ? '卖出' : t.type}</td>
+        <td>${t.type === 'buy' ? '买入' : t.type === 'sell' ? '卖出' : t.type === 'dividend' ? '分红' : t.type}</td>
         <td>${fmt(t.amount)}</td>
         <td>${fmt(t.shares)}</td>
         <td>${fmt(t.nav, 4)}</td>
@@ -573,16 +629,29 @@ function bindUi() {
   if (btnRefresh) btnRefresh.onclick = async () => {
     const original = btnRefresh.textContent;
     btnRefresh.disabled = true;
-    btnRefresh.textContent = '刷新净值中...';
+    const statusEl = safeGet('refresh-status');
     try {
-      await api('/funds/refresh-all', { method: 'POST' });
-      await loadEstimate();
+      const r = await api('/funds/refresh-all', { method: 'POST' });
+      if (r.started) {
+        // 异步轮询进度, 不阻塞按钮; 完成后拉一次最新估算
+        while (true) {
+          const s = await api('/funds/refresh-all/status');
+          if (statusEl) statusEl.textContent = `刷新净值中 ${s.done}/${s.total}`;
+          if (!s.running) break;
+          await sleep(900);
+        }
+        if (statusEl) statusEl.textContent = `已刷新 ${r.total} 只`;
+        refreshEstimate(); // 异步, 不阻塞
+      } else if (r.alreadyRunning) {
+        if (statusEl) statusEl.textContent = '已有刷新任务进行中…';
+      }
     } catch (e) {
       console.warn('刷新净值失败(可能无网络):', e.message);
       alert('刷新净值失败：' + e.message + '\n（请检查网络，净值需联网从东方财富获取）');
     } finally {
       btnRefresh.disabled = false;
       btnRefresh.textContent = original;
+      setTimeout(() => { if (statusEl) statusEl.textContent = ''; }, 2500);
     }
   };
 
@@ -598,7 +667,7 @@ function bindUi() {
         delBtn.textContent = '删除中...';
         try {
           await api(`/holdings/${code}`, { method: 'DELETE' });
-          await loadEstimate();
+          await refreshEstimate();
         } catch (err) {
           alert('删除失败：' + err.message);
           delBtn.disabled = false;
@@ -609,12 +678,10 @@ function bindUi() {
       const detailBtn = e.target.closest('[data-detail]');
       if (detailBtn) {
         const code = detailBtn.getAttribute('data-detail');
-        try {
-          const data = await api('/estimate');
-          const f = data.funds.find((x) => x.fund_code === code);
+        // 直接复用首页已加载的估值缓存(含持仓贡献明细), 避免每次点开明细都重算一次组合
+        if (lastEstimateData && lastEstimateData.funds) {
+          const f = lastEstimateData.funds.find((x) => x.fund_code === code);
           if (f) toggleDetail(f);
-        } catch (err) {
-          console.error('加载明细失败', err);
         }
       }
     });
@@ -675,13 +742,14 @@ function bindUi() {
   }
 
   // 初始化数据（各自独立 try-catch，互不阻塞）
-  loadEstimate().catch((e) => console.error('loadEstimate 失败', e));
+  refreshEstimate().catch((e) => console.error('refreshEstimate 失败', e));
   loadFunds().catch((e) => console.error('loadFunds 失败', e));
   loadTransactions().catch((e) => console.error('loadTransactions 失败', e));
+  // 自动刷新: 走缓存(即时返回), 真正重算在后台; 60s 一次足以跟踪盘中, 且不会频繁打公共接口
   setInterval(() => {
     const active = document.querySelector('.tab.active');
-    if (active && active.dataset.tab === 'holdings') loadEstimate().catch(() => {});
-  }, 10 * 60 * 1000);
+    if (active && active.dataset.tab === 'holdings') refreshEstimate().catch(() => {});
+  }, 60 * 1000);
 }
 
 // app.js 位于 </body> 之前，执行时 DOM 已就绪，直接绑定即可。

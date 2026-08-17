@@ -2,9 +2,12 @@
  * 实时涨跌幅估算引擎
  *
  * 原理：
- * 基金实时估值涨跌幅 ≈ Σ(成分股占比_i × 成分股实时涨跌幅_i) + 现金/债券部分(用昨净值近似为0波动)
- * 其中占比来自最近一期季报/年报披露的"占净值比例"。
- * 仅用股票部分估算，故估算值偏向股票仓位贡献，已足够盘中跟踪趋势。
+ * 基金实时估值涨跌幅 ≈ Σ(披露成分股占比_i × 成分股实时涨跌幅_i)
+ *                     + (100% − 披露占比合计) × 基准指数(行业/宽基)实时涨跌幅
+ * 其中占比来自最近一期季报/年报披露的"占净值比例"（通常只披露前十大重仓，合计 30%~90%）。
+ * 未披露部分(剩余仓位)按基金所属行业/宽基指数(track_index，缺省为沪深300)当日涨跌补齐，
+ * 避免把大量未披露仓位简单视作 0 波动导致估算系统性偏低；债券/货币/QDII 基金无权益基准，
+ * 该部分仍近似为 0 波动。
  *
  * 持仓总市值 = Σ(每只基金 持有份额 × (最新净值 × (1 + 估算涨跌幅)))
  * 当日盈亏 = 持仓总市值 - 持仓成本(或昨日市值)
@@ -78,11 +81,16 @@ async function estimateFund(fundCode, quotes) {
   const period = rows.length ? rows[0].report_period || null : null;
   const holdings_stale = isReportStale(period);
 
-  // 路径1: 重仓股加权
+  // 路径1: 重仓股加权 + 未披露仓位用基准指数(行业/宽基)补齐
   if (rows.length) {
+    // 该基金的基准指数(track_index): 用于代理"季报未披露"的那部分仓位(通常 30%~90%)
+    const fund = db.prepare(`SELECT track_index FROM fund WHERE code=?`).get(fundCode);
+    const benchmarkCode = fund && fund.track_index ? fund.track_index : null;
+    // 所需行情代码: 披露持仓股 + (存在基准指数时包含基准)
     const codes = [...new Set(rows.map((r) => normalizeCode(r.stock_code)))];
-    const qMap = quotes || (await getRealtimeQuotes(codes));
-    let pct = 0; // 股票部分贡献(%)
+    const needCodes = benchmarkCode ? [...codes, normalizeCode(benchmarkCode)] : codes;
+    const qMap = quotes || (await getRealtimeQuotes(needCodes));
+    let pct = 0; // 披露持仓股票部分贡献(%)
     const detail = rows.map((r) => {
       const q = qMap[normalizeCode(r.stock_code)] || {};
       const contribution = (r.ratio / 100) * (q.pct_change || 0);
@@ -95,11 +103,25 @@ async function estimateFund(fundCode, quotes) {
         contribution: Number(contribution.toFixed(3)),
       };
     });
+    // 披露持仓占比合计(%); 其余(100% - 披露)按基准指数当日涨跌补齐
+    const disclosedRatio = rows.reduce((s, r) => s + (r.ratio || 0), 0);
+    const residualRatio = Math.max(0, 100 - disclosedRatio); // 未披露仓位占比(%)
+    let benchmarkPct = null;
+    let residualContribution = 0;
+    if (benchmarkCode && residualRatio > 0.01) {
+      const bq = qMap[normalizeCode(benchmarkCode)] || qMap[benchmarkCode] || {};
+      if (bq && bq.pct_change != null) {
+        benchmarkPct = bq.pct_change;
+        residualContribution = (residualRatio / 100) * benchmarkPct; // 指数补齐贡献(%)
+      }
+    }
     return {
-      pct: Number(pct.toFixed(2)),
+      pct: Number((pct + residualContribution).toFixed(2)),
       stocks: detail,
       method: 'stock',
-      index_code: null,
+      index_code: benchmarkCode,
+      benchmark_pct: benchmarkPct,
+      residual_ratio: Number(residualRatio.toFixed(2)),
       intraday_supported: true,
       holdings_period: period,
       holdings_stale,
@@ -253,6 +275,8 @@ async function estimatePortfolio() {
       intraday_supported: est.intraday_supported,
       method: est.method,
       index_code: est.index_code,
+      benchmark_pct: est.benchmark_pct,
+      residual_ratio: est.residual_ratio,
       holdings_period: est.holdings_period,
       holdings_stale: est.holdings_stale,
     });

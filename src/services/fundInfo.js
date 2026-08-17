@@ -129,4 +129,51 @@ async function searchFundByName(name) {
   }
 }
 
-module.exports = { getFundBase, getFundHoldings, searchFundByName };
+// 取基金历史净值(按日期)。用于交易份额回填: 申购/赎回的净值在交易日后才公布。
+// 规则: 交易时间 < 15:00 用当日(T)净值; >= 15:00 用下一交易日(T+1)净值。
+// lsjz 仅返回交易日净值, 故在 tradeDate..+12 天窗口内取第一条满足条件的行(自动跳过周末/假期)。
+async function getNavByDate(code, tradeDate, tradeTime) {
+  if (!code || !tradeDate) return null;
+  const end = addDays(tradeDate, 12);
+  const rows = await fetchLsjz(code, tradeDate, end);
+  if (!rows.length) return null;
+  const hhmm = (tradeTime || '').slice(0, 5);
+  const afterCutoff = !hhmm || hhmm >= '15:00';
+  const target = afterCutoff
+    ? rows.find((r) => r.FSRQ > tradeDate)   // T+1: 严格晚于交易日的首个交易日
+    : rows.find((r) => r.FSRQ >= tradeDate); // T 日: 当日或之后首个交易日
+  if (!target) return null;
+  const nav = parseFloat(target.DWJZ);
+  if (isNaN(nav)) return null;
+  return { nav, nav_date: target.FSRQ };
+}
+
+// 拉取某区间历史净值(升序), 失败返回空数组(防御式, 不抛)
+async function fetchLsjz(code, startDate, endDate) {
+  try {
+    const url =
+      `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}` +
+      `&pageIndex=1&pageSize=30&startDate=${startDate}&endDate=${endDate}`;
+    const res = await fetch(url, {
+      headers: { Referer: 'https://fundf10.eastmoney.com', 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(8000),
+    });
+    const d = await res.json();
+    const list = (d && d.Data && d.Data.LSJZList) || [];
+    return list
+      .map((r) => ({ FSRQ: r.FSRQ, DWJZ: r.DWJZ }))
+      .filter((r) => r.FSRQ && r.DWJZ != null)
+      .sort((a, b) => (a.FSRQ < b.FSRQ ? -1 : a.FSRQ > b.FSRQ ? 1 : 0));
+  } catch (e) {
+    console.warn('获取历史净值失败', code, e.message);
+    return [];
+  }
+}
+
+function addDays(dateStr, n) {
+  const d = new Date(dateStr + 'T00:00:00Z'); // UTC 解析, 避免本地时区导致跨日错误
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+module.exports = { getFundBase, getFundHoldings, searchFundByName, getNavByDate };

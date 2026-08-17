@@ -43,3 +43,32 @@ test('normalizeCode: 不应把 A 股 6 位代码误判为港股', () => {
   assert.notStrictEqual(normalizeCode('007000'), 'hk007000');
   assert.strictEqual(normalizeCode('007000'), 'sz007000');
 });
+
+// 还原真实 fetch, 避免污染其它测试(本文件其它用例不依赖网络)
+test('fetchFromSina: 大列表按块拆分请求并合并(规避新浪单请求上限)', async () => {
+  const { fetchFromSina } = require('../src/services/quotes');
+  const realFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url) => {
+    calls.push(url);
+    const listPart = url.split('list=')[1];
+    const codes = listPart.split(',');
+    let body = '';
+    for (const c of codes) body += `var hq_str_${c}="NAME,100,100,110,...";`;
+    return { arrayBuffer: async () => new TextEncoder().encode(body).buffer };
+  };
+  try {
+    const codes = [];
+    for (let i = 0; i < 120; i++) codes.push('sh' + (600000 + i));
+    const out = await fetchFromSina(codes);
+    // 120 个 A 股代码, SINA_CHUNK=50 -> 至少 2 块(验证分块, 而非一次巨请求把新浪打空)
+    assert.ok(calls.length >= 2, `应拆分为多次请求, 实际 ${calls.length} 次`);
+    assert.strictEqual(Object.keys(out).length, 120, '应合并返回全部 120 个代码');
+    for (const url of calls) {
+      const n = url.split('list=')[1].split(',').length;
+      assert.ok(n <= 50, `单块不应超过 50, 实际 ${n}`);
+    }
+  } finally {
+    global.fetch = realFetch;
+  }
+});

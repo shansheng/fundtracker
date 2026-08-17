@@ -26,6 +26,13 @@ body {
 .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--panel-2); color: var(--muted); }
 .topbar-actions { display: flex; align-items: center; gap: 12px; }
 .muted { color: var(--muted); font-size: 13px; }
+.refresh-status { font-size: 12px; color: var(--muted); white-space: nowrap; min-width: 0; }
+.est-status { font-size: 12px; color: var(--accent); white-space: nowrap; min-width: 0; }
+.est-status.active::before {
+  content: '●'; margin-right: 4px; font-size: 10px; vertical-align: middle;
+  animation: est-blink 1s steps(2, start) infinite;
+}
+@keyframes est-blink { 50% { opacity: 0.25; } }
 
 .stats { padding: 14px 22px 8px; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; }

@@ -84,6 +84,8 @@ const NOISE_WORDS = [
   '持有收益', '收益率', '市场', '排行', '自选', '超额', '全部', '更多',
   '资产', '总收益', '累计', '明细', '估值', '涨跌', '今日', '昨日', '净值', '份额', '成本',
   '排序', '指数基金', '高端装备股票', '高质量混合',
+  // 腾讯理财通截图常见表头/横幅词
+  '腾讯', '理财通', '资产明细', '筛选', '产品解读', '恭喜', '详情', '跑赢',
   // 注意: "稳健" 是基金名常见字(如格林稳健价值), 不可作噪声词
 ];
 // 基金名必含的类型特征词 (白名单, "指数"属于此类, 不列入噪声)
@@ -100,6 +102,12 @@ function normalizeThousands(text) {
   return text.replace(/(\d{1,3})\.(\d{3})(?:\.(\d{2}))?(?=[^\d]|$)/g, (m, a, b, c) =>
     c !== undefined ? `${a},${b}.${c}` : `${a},${b}`
   );
+}
+
+// OCR 常把负号 "-" 误识别为等号 "=", 例如持仓收益 "-2.22" 被识别成 "=2.22".
+// 在行内把孤立的 "=数字" 修正为 "-数字"(截图里基本不存在真正的等号)。
+function normalizeSigns(text) {
+  return text.replace(/(^|\s)\s*=\s*(\d)/g, '$1-$2');
 }
 
 // 判断一行是否为"纯数值行"(几乎全是数字/符号/空白, 不含汉字、不含冒号、不含字母)
@@ -288,6 +296,82 @@ function parseFundsByName(text) {
   return found;
 }
 
+/**
+ * 腾讯理财通持仓截图解析
+ * 版式(实测): 每个基金占一个卡片, 从上到下为
+ *   基金名称
+ *   持有金额  持仓收益  昨日收益
+ *   5,591.46  -580.84  -50.04
+ * 特点: 无基金代码、无持有份额、无收益率%。
+ */
+function parseLicaitongHolding(text) {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => normalizeSigns(normalizeThousands(l)).replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+
+  const SKIP = [
+    /^\d{1,2}:\d{2}/,
+    /腾讯理财通|资产明细|筛选|按.*排序|产品解读|恭喜|跑赢|近\d+月|详情/,
+    /市场有风险|投资需谨慎/,
+  ];
+  const isSkip = (l) => {
+    const cl = l.replace(/\s/g, '');
+    return SKIP.some((re) => re.test(cl));
+  };
+
+  const funds = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isSkip(line)) continue;
+
+    // 识别表头行 "持有金额 持仓收益 昨日收益"
+    const compact = line.replace(/\s/g, '');
+    if (/持有金额.*持仓收益.*昨日收益/.test(compact)) {
+      // 上一行找基金名(跳过噪声行与表头行)
+      let name = '';
+      for (let j = i - 1; j >= 0; j--) {
+        const prev = lines[j];
+        if (isSkip(prev)) continue;
+        const pc = prev.replace(/\s/g, '');
+        if (/持有金额|持仓收益|昨日收益/.test(pc)) continue;
+        if (/[一-龥]/.test(pc) && looksLikeFundName(pc)) {
+          name = pc;
+          break;
+        }
+      }
+
+      // 数值可能在表头下一行, 也可能因 OCR 粘连与表头在同一行
+      let valLine = null;
+      const next = lines[i + 1];
+      if (next && isNumberLine(next)) {
+        valLine = next;
+        i++;
+      } else if (extractNumbers(compact).length >= 3) {
+        valLine = line;
+      }
+
+      if (valLine) {
+        const nums = extractNumbers(valLine.replace(/\s/g, ''));
+        // 三个数值分别对应: 持有金额 / 持仓收益 / 昨日收益
+        if (nums.length >= 1) {
+          funds.push({
+            code: '',
+            name,
+            market_value: nums[0].value,
+            shares: null,
+            hold_profit: nums[1] ? nums[1].value : null,
+            yest_profit: nums[2] ? nums[2].value : null,
+            yest_pct: null,
+            cost: null,
+          });
+        }
+      }
+    }
+  }
+  return funds;
+}
+
 // 判断 OCR 文本中是否含可识别的基金代码
 function hasFundCodes(text) {
   return /\b\d{6}\b/.test(text);
@@ -301,6 +385,14 @@ function hasFundCodes(text) {
  * 返回: { platform, funds: [{code?, name?, market_value?, shares?, cost?}] }
  */
 function parseHolding(text, platform) {
+  // 腾讯理财通持仓截图有专属版式(三列: 持有金额/持仓收益/昨日收益), 优先用专用解析器
+  if (platform === 'licaitong' && /持有金额.*昨日收益|腾讯理财通|资产明细/.test(text.replace(/\s/g, ''))) {
+    const funds = parseLicaitongHolding(text);
+    if (funds.length) {
+      return { platform, kind: 'holding', funds, by_name: true };
+    }
+  }
+
   if (hasFundCodes(text)) {
     // 有代码时, 仍尝试把整段金额/份额按位置配对(稳健优先)
     const codes = [...new Set((text.match(/\b(\d{6})\b/g) || []))];
@@ -331,11 +423,240 @@ function parseHolding(text, platform) {
 }
 
 /**
+ * 解析支付宝/蚂蚁财富「交易记录」列表截图
+ * 版式(实测): 每条交易占 1~3 行
+ *   买入/卖出 基金 | 基金名称 金额元
+ *   2026-08-11 23:04:20
+ * 名称偶尔跨行(如 "方正富邦中证保险主题" + "指数(LOF)A")。
+ * 返回: { platform, kind: 'trade', txs: [{fund_code:'', name, type, amount, shares:null, nav:null, date}], by_name: true }
+ */
+function parseAlipayTrade(text) {
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  // 预处理: 日期行保留空格; 其余行去空格并修正常见 OCR 错字
+  const lines = rawLines.map((l) => {
+    const dateM = l.match(/^(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})$/);
+    if (dateM) return `${dateM[1]} ${dateM[2]}`;
+    let s = l.replace(/\s+/g, '');
+    // 常见 OCR 错字修正
+    s = s.replace(/害信/g, '睿信'); // 永赢睿信
+    return s;
+  });
+
+  const txs = [];
+  let pendingName = '';
+  let pendingType = null;
+  let pendingAmount = null;
+
+  const pushPending = (date) => {
+    if (pendingName && pendingAmount != null && pendingType) {
+      txs.push({
+        fund_code: '',
+        name: pendingName,
+        type: pendingType,
+        amount: pendingAmount,
+        shares: null,
+        nav: null,
+        date: date || null,
+      });
+    }
+    pendingName = '';
+    pendingType = null;
+    pendingAmount = null;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // 日期行: 如果有未决交易则收尾
+    const dateMatch = line.match(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})$/);
+    if (dateMatch) {
+      pushPending(dateMatch[1]);
+      continue;
+    }
+
+    // 交易行: 买入/卖出 基金 | 名称 金额元
+    const txMatch = line.match(/^(买入|卖出|赎回|售出)基金\|(.+?)(\d+(?:\.\d+)?)元$/);
+    if (txMatch) {
+      pushPending(null);
+      const action = txMatch[1];
+      pendingType = /卖出|赎回|售出/.test(action) ? 'sell' : 'buy';
+      pendingName = txMatch[2].trim();
+      pendingAmount = parseFloat(txMatch[3]);
+      continue;
+    }
+
+    // 名称续行: 中文续行 或 短份额后缀如 A1 / C / (LOF)A
+    if (pendingName && !line.includes('元') && !line.includes('基金')) {
+      const isCn = /[一-龥]/.test(line);
+      const isShortSuffix = !isCn && line.length <= 12 && /^[A-Za-z0-9()（）\-]+$/.test(line);
+      if (isCn || isShortSuffix) {
+        pendingName += line;
+        continue;
+      }
+    }
+  }
+  pushPending(null);
+
+  if (txs.length) return { platform: 'alipay', kind: 'trade', txs, by_name: true };
+  return null;
+}
+
+/**
+ * 解析京东金融「账户明细→交易」列表截图
+ * 版式(实测): 每条交易占 2~4 行
+ *   转入-基金名称 金额元
+ *   (名称续行, 如 ETF 联接 C / 证券投资基金 A 类)
+ *   08-13 22:15:26  状态词
+ * 特点:
+ *   - 操作词: 转入(buy)、转出(sell)、分红(dividend)
+ *   - 日期为 MM-DD HH:mm:ss, 无年份, 需按当前日期推断
+ *   - 日期与时间可能粘连(如 08-1102:36:17)
+ *   - OCR 噪声多: 前缀 "人" / "(2)" / 乱码; 金额末尾 "元" 常被误识为 "T" / "7T"
+ * 返回: { platform: 'jd', kind: 'trade', txs, by_name: true }
+ */
+function parseJDTrade(text) {
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  // 预处理: 去除空格并修正常见 OCR 错字
+  const lines = rawLines.map((l) => {
+    let s = l.replace(/\s+/g, '');
+    // 金额末尾 "元" 常被误识为 "7T"/"T"/"丁"
+    s = s.replace(/(\d)(?:7T|T|丁)$/g, '$1元');
+    // 京东金额千分位逗号有时被识成点, 已在 normalizeThousands 处理; 这里只做尾部修正
+    return s;
+  });
+
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const currentMonth = now.getMonth() + 1;
+
+  const txs = [];
+  let pendingName = '';
+  let pendingType = null;
+  let pendingAmount = null;
+  let lastActionType = null; // 用于 OCR 彻底乱码的条目推断
+
+  const stripNameNoise = (name) =>
+    name
+      .replace(/["""'`´‘’“”]/g, '') // 各类引号(OCR 常把金额边界识别为引号)
+      .replace(/^[\-－]+/, '') // 行首多余横杠
+      .replace(/([ABCEDI])类/g, '$1') // "C类" -> "C", 便于 suffix 匹配
+      .replace(/[。\.]+$/, '') // 行尾句号
+      .trim();
+
+  const pushPending = (date) => {
+    if (pendingName && pendingAmount != null && pendingType) {
+      txs.push({
+        fund_code: '',
+        name: stripNameNoise(pendingName),
+        type: pendingType,
+        amount: pendingAmount,
+        shares: null,
+        nav: null,
+        date: date || null,
+      });
+      lastActionType = pendingType;
+    }
+    pendingName = '';
+    pendingType = null;
+    pendingAmount = null;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // 日期行: 08-13 22:15:26 或 08-1102:36:17(粘连)
+    // 先尝试粘连格式, 再尝试正常格式
+    const gluedDate = line.match(/^(\d{2})-(\d{2})(\d{2}):(\d{2}):(\d{2})/);
+    const normalDate = line.match(/^(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+    const dateM = gluedDate || normalDate;
+    if (dateM) {
+      const [, m, d, h, min, sec] = dateM;
+      const month = parseInt(m, 10);
+      // 推断年份: 若月份 > 当前月, 说明是去年的截图(跨年时); 否则今年
+      const year = month > currentMonth ? currentYear - 1 : currentYear;
+      const dateStr = `${year}-${m}-${d} ${h}:${min}:${sec}`;
+      pushPending(dateStr);
+      continue;
+    }
+
+    // 去掉行首常见噪声前缀: 人 / (2) / 乱码片段(非中文非英文的稀有字符)
+    const cleaned = line
+      .replace(/^[（(]\d+[)）]/, '') // (2)
+      .replace(/^[^\u4e00-\u9fa5A-Za-z0-9\-]+/, '') // 乱码前缀
+      .replace(/^人/, ''); // "人 转 入" 的 OCR 噪声
+
+    // 交易行: 转入-名称...金额元 / 转出-名称...金额元 / 分红-名称...金额元
+    // 名称在前、金额在后; 金额是行尾 "xxx元" 且前面是基金名
+    const txMatch = cleaned.match(/^(转入|转出|分红)[\-－]?(.*?)(\d+(?:\.\d+)?)元$/);
+    if (txMatch) {
+      pushPending(null);
+      const action = txMatch[1];
+      if (action === '转入') pendingType = 'buy';
+      else if (action === '转出') pendingType = 'sell';
+      else pendingType = 'dividend';
+      pendingName = txMatch[2].trim();
+      pendingAmount = parseFloat(txMatch[3]);
+      continue;
+    }
+
+    // 名称续行: 当前有待处理交易, 且本行不是日期、不含金额。
+    // 京东常把名称后缀与状态词放在同一行, 如 "资产混合C支付成功" / "ETF联接C订单完成",
+    // 因此先把状态词去掉, 再判断剩余部分是否像基金名后缀。
+    if (pendingName && !line.match(/^\d{2}-\d{2}/) && !line.includes('元')) {
+      const stripped = line
+        .replace(/支付成功|订单完成|现金发放|转出完成|交易完成|进行中/g, '')
+        .trim();
+      if (stripped && /[一-龥A-Za-z（）()]/.test(stripped)) {
+        pendingName += stripped;
+        continue;
+      }
+    }
+
+    // Fallback: OCR 把基金名完全识别成乱码拉丁字母(如 BAN-HLEXEREREREC),
+    // 但行首有序号 (2) 且含金额。此时沿用上一个已确认的操作类型,
+    // 并把原始乱码名保留下来(供前端标红、用户手动修正)。
+    if (!pendingName && pendingAmount == null && line.includes('元')) {
+      const idxAmount = line.match(/^[（(]\d+[)）]([^\d]*?)(\d+(?:\.\d+)?)元$/);
+      if (idxAmount && lastActionType && !/[一-龥]/.test(idxAmount[1])) {
+        pendingType = lastActionType;
+        pendingName = idxAmount[1].trim() || '(名称未识别)';
+        pendingAmount = parseFloat(idxAmount[2]);
+        continue;
+      }
+    }
+  }
+  pushPending(null);
+
+  if (txs.length) return { platform: 'jd', kind: 'trade', txs, by_name: true };
+  return null;
+}
+
+/**
  * 解析交易截图文本
  * 交易截图一般含代码或金额, 逻辑同前; 无代码时按名称
  * 返回: { platform, txs: [{fund_code, name?, type, amount, shares, nav, date}] }
  */
 function parseTrade(text, platform) {
+  // 支付宝/蚂蚁财富交易记录列表有专属版式, 优先用专用解析器
+  if ((platform === 'alipay' || platform === 'taobao') && /交易记录|买入基金|卖出基金/.test(text.replace(/\s/g, ''))) {
+    const specialized = parseAlipayTrade(text);
+    if (specialized && specialized.txs.length) return specialized;
+  }
+
+  // 京东金融账户明细→交易 有专属版式
+  if (platform === 'jd' && /账户明细|转入|转出|分红/.test(text.replace(/\s/g, ''))) {
+    const specialized = parseJDTrade(text);
+    if (specialized && specialized.txs.length) return specialized;
+  }
+
   const isBuy = /买入|申购|定投|购买/.test(text);
   const isSell = /卖出|赎回|售出/.test(text);
   const type = isSell ? 'sell' : isBuy ? 'buy' : 'buy';
@@ -372,9 +693,57 @@ function parseTrade(text, platform) {
   return { platform, kind: 'trade', txs, by_name: true };
 }
 
+// 计算两字符串最长公共子串长度(用于名称相似度)
+function longestCommonSubstring(a, b) {
+  if (!a || !b) return 0;
+  const m = a.length, n = b.length;
+  const dp = Array(n + 1).fill(0);
+  let max = 0;
+  for (let i = 1; i <= m; i++) {
+    let prev = 0;
+    for (let j = 1; j <= n; j++) {
+      const temp = dp[j];
+      if (a[i - 1] === b[j - 1]) {
+        dp[j] = prev + 1;
+        max = Math.max(max, dp[j]);
+      } else {
+        dp[j] = 0;
+      }
+      prev = temp;
+    }
+  }
+  return max;
+}
+
+// 从候选列表中选出与 query 名称最匹配的基金
+// 策略: 精确匹配 > 包含关系 > 相似度评分(公共子串 + 份额后缀一致 + 基金公司前缀一致)
+function pickBestMatch(candidates, query) {
+  const normalize = (s) => (s || '').replace(/\s/g, '').replace(/([ABCEDI])类/g, '$1').trim();
+  const q = normalize(query);
+  if (!q || !candidates.length) return null;
+  let best = null, bestScore = -1;
+  for (const c of candidates) {
+    const name = normalize(c.name);
+    if (!name) continue;
+    if (name === q) return c;               // 精确匹配
+    if (name.includes(q) || q.includes(name)) return c; // 包含关系
+    const lcs = longestCommonSubstring(q, name);
+    const suffixQ = q.slice(-1).toUpperCase();
+    const suffixC = name.slice(-1).toUpperCase();
+    const suffixMatch = /[ABCEDI]/.test(suffixQ) && suffixQ === suffixC ? 10 : 0;
+    const prefixMatch = q.slice(0, 4) === name.slice(0, 4) ? 8 : 0;
+    const score = lcs + suffixMatch + prefixMatch;
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
+}
+
 /**
  * 对解析结果中"只有名称无代码"的基金, 调用公共接口按名称查代码
- * 在 OCR 服务端自动补全; 每个名称取搜索结果中第一个精确/包含匹配项
+ * 在 OCR 服务端自动补全; 每个名称取搜索结果中最相似匹配项
  * @returns 同样的 result, 但 funds/txs 的 code 字段被填充(无法匹配的留空)
  */
 async function resolveNames(result) {
@@ -386,11 +755,11 @@ async function resolveNames(result) {
     if (!nm || it.code) continue;
     const candidates = await searchFundByName(nm);
     if (candidates.length) {
-      // 优先精确匹配, 否则取首个
-      const exact = candidates.find((c) => c.name === nm || c.name.replace(/\s/g, '') === nm.replace(/\s/g, ''));
-      const pick = exact || candidates[0];
-      it.code = pick.code;
-      it.name_matched = pick.name; // 记录接口返回的真实名称, 供前端展示核对
+      const pick = pickBestMatch(candidates, nm);
+      if (pick) {
+        it.code = pick.code;
+        it.name_matched = pick.name; // 记录接口返回的真实名称, 供前端展示核对
+      }
     }
   }
   return result;
@@ -411,7 +780,7 @@ async function recognizeScreenshot(filePath, platform, kind) {
   return result;
 }
 
-module.exports = { recognizeScreenshot, ocrImage, parseHolding, parseTrade, resolveNames };
+module.exports = { recognizeScreenshot, ocrImage, parseHolding, parseTrade, parseAlipayTrade, parseJDTrade, resolveNames, pickBestMatch };
 
 // 测试用：node src/services/ocr.js <file> <platform> <kind>
 if (require.main === module) {

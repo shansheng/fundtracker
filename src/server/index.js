@@ -7,12 +7,15 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { getDb, init } = require('../db/db');
+const { getDb, init, save } = require('../db/db');
+const { backfillTxnShares } = require('../services/txnShares');
 const WEB_DIR = path.join(__dirname, '../../web');
 const { recognizeScreenshot, resolveNames } = require('../services/ocr');
 const { searchFundByName } = require('../services/fundInfo');
 const { estimatePortfolio, estimateFund, refreshFundInfo } = require('../services/estimator');
 const { getRealtimeQuotes, normalizeCode } = require('../services/quotes');
+const { getCachedSnapshot, getStatus, triggerRefresh } = require('../services/estimateCache');
+const { mapLimit, sleep } = require('../services/concurrency');
 
 const app = express();
 app.use(express.json({ limit: '20mb' }));
@@ -72,24 +75,66 @@ router.post('/funds/:code/refresh', async (req, res) => {
 });
 
 // 批量刷新所有持仓基金的净值(用于主界面"刷新净值"按钮)
-router.post('/funds/refresh-all', async (req, res) => {
-  try {
-    const codes = [...new Set(
-      getDb().prepare(`SELECT DISTINCT fund_code FROM holding`).all().map((r) => r.fund_code)
-    )];
-    const results = [];
-    for (const code of codes) {
-      try {
-        await refreshFundInfo(code);
-        results.push({ code, ok: true });
-      } catch (e) {
-        results.push({ code, ok: false, error: e.message });
-      }
-    }
-    res.json({ ok: true, refreshed: results });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+// 异步 + 限流: 立即返回, 后台以有限并发刷新东方财富(避免被公共接口限流); 前端轮询进度。
+let refreshJob = null; // 仅保留最近一次任务状态(单用户本地场景足够)
+const REFRESH_CONCURRENCY = 4; // 对东方财富最大并发
+const REFRESH_GAP_MS = 150;    // 每只之间的间隔, 进一步降低被限流概率
+router.post('/funds/refresh-all', (req, res) => {
+  if (refreshJob && !refreshJob.finished) {
+    return res.json({ ok: true, started: false, alreadyRunning: true, jobId: refreshJob.id });
   }
+  const codes = [...new Set(
+    getDb().prepare(`SELECT DISTINCT fund_code FROM holding`).all().map((r) => r.fund_code)
+  )];
+  const job = {
+    id: Date.now(),
+    total: codes.length,
+    done: 0,
+    ok: 0,
+    failed: 0,
+    results: [],
+    finished: false,
+    startedAt: Date.now(),
+    error: null,
+  };
+  refreshJob = job;
+  // 后台异步执行(不等完成即返回 202 语义)
+  (async () => {
+    try {
+      job.results = await mapLimit(codes, REFRESH_CONCURRENCY, async (code) => {
+        await sleep(REFRESH_GAP_MS); // 限流: 控制请求频率
+        try {
+          await refreshFundInfo(code);
+          job.ok++;
+          return { code, ok: true };
+        } catch (e) {
+          job.failed++;
+          return { code, ok: false, error: e.message };
+        } finally {
+          job.done++;
+        }
+      });
+    } catch (e) {
+      job.error = e.message;
+    } finally {
+      job.finished = true;
+      // 净值刷新完成后, 触发一次估算后台重算(让新净值进入实时估值)
+      triggerRefresh(true);
+    }
+  })();
+  res.json({ ok: true, started: true, jobId: job.id, total: codes.length });
+});
+
+// 刷新净值任务进度轮询(前端"刷新中 N/total"用)
+router.get('/funds/refresh-all/status', (req, res) => {
+  if (!refreshJob) return res.json({ running: false, total: 0, done: 0, ok: 0, failed: 0 });
+  res.json({
+    running: !refreshJob.finished,
+    total: refreshJob.total,
+    done: refreshJob.done,
+    ok: refreshJob.ok,
+    failed: refreshJob.failed,
+  });
 });
 
 // ---- 持仓列表 ----
@@ -184,13 +229,31 @@ router.post('/transactions', (req, res) => {
   res.json({ ok: true });
 });
 
-// ---- 实时估算(整个组合) ----
-router.get('/estimate', async (req, res) => {
+// 回填交易份额: 对"有金额/日期但份额为空"的交易, 按交易日+15:00规则取历史净值算份额
+// 可选 body.source 仅回填指定来源(如 'ocr_alipay_trade'); 用有限并发限制公共接口频率
+router.post('/transactions/backfill-shares', async (req, res) => {
   try {
-    const data = await estimatePortfolio();
-    res.json(data);
+    const { source } = req.body || {};
+    const db = getDb();
+    const result = await backfillTxnShares(db, { source });
+    save();
+    res.json({ ok: true, ...result });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- 实时估算(整个组合) ----
+// 异步优化: 立即返回内存缓存的估值(毫秒级), 同时后台触发重算; 前端据 computing 标志轮询补齐。
+// 30s 内多次刷新只重算一次, 避免重复打新浪行情被限流。首屏无缓存时返回 computing:true 占位。
+router.get('/estimate', (req, res) => {
+  const cached = getCachedSnapshot();
+  const status = getStatus();
+  triggerRefresh(false); // 缺失/过期则后台重算(非阻塞)
+  if (cached) {
+    res.json({ ...cached, computing: status.computing, cached_at: status.cachedAt });
+  } else {
+    res.json({ computing: true, total: {}, funds: [], cached_at: null });
   }
 });
 

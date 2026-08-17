@@ -110,6 +110,8 @@ async function init() {
     'ALTER TABLE fund ADD COLUMN track_index TEXT',
     // Phase 2: 复活 stock_quote 作为行情缓存, ts 存 epoch ms 用于 30s TTL 判定与冷启动预热
     'ALTER TABLE stock_quote ADD COLUMN ts INTEGER',
+    // 交易份额回填: 记录算份额所采用的净值日期(申购 15:00 前用 T 日净值, 15:00 后用 T+1 净值)
+    'ALTER TABLE txn ADD COLUMN nav_date TEXT',
   ];
   for (const sql of migrateSql) {
     try { _db.run(sql); } catch (e) { /* 列已存在则忽略 */ }
@@ -127,6 +129,37 @@ async function init() {
         [idx, code]
       );
     } catch (e) { /* 基金不存在则忽略 */ }
+  }
+  // Phase 4: 为有持仓但缺基准指数的"权益类"基金补齐默认宽基基准(沪深300)，
+  // 供估算引擎代理"季报未披露仓位"的涨跌(见 estimator 路径1 的 residual 补齐)。
+  // 排除债券/货币/QDII: 债券/现金 ≈ 0 波动、QDII 持有海外资产不跟踪 A 股宽基，强行补齐反而失真。
+  // 注意: fund.type 不可靠(债券常被误标为"其他")，故同时用名称关键词兜底排除债券/货基/QDII。
+  // SQLite(WASM) 无 REGEXP 扩展，候选行取出后在 JS 端按名称正则过滤，再逐只幂等 UPDATE。
+  try {
+    // 名称含"债"字(债券/双利债/股债配置等)一律视为债券或偏债, 不设置权益基准;
+    // 债券/货基/QDII 的剩余仓位不跟踪 A 股宽基, 强行补齐反而失真。
+    const NON_EQUITY_RE = /(债|货币|理财|QDII|合格境内|沪港通|深港通|港股通|沪港深)/i;
+    // 注意: _db 是原始 sql.js Database, 无 prepare().all(); 用模块内 all() 辅助查询
+    const candidates = all(
+      `SELECT f.code, f.name, f.type FROM fund f
+       WHERE (f.track_index IS NULL OR f.track_index='')
+         AND f.code IN (SELECT DISTINCT fund_code FROM fund_stock)
+         AND COALESCE(f.type,'') NOT IN ('债券型','货币型','QDII')`
+    );
+    let benchN = 0;
+    for (const c of candidates) {
+      if (c.name && NON_EQUITY_RE.test(c.name)) continue; // 债券/货基/海外 -> 不设置权益基准
+      _db.run(
+        `UPDATE fund SET track_index='sh000300' WHERE code=? AND (track_index IS NULL OR track_index='')`,
+        [c.code]
+      );
+      benchN++;
+    }
+    if (benchN > 0) {
+      console.log(`[db] 已为 ${benchN} 只权益类持仓基金补齐默认基准指数 sh000300(沪深300)`);
+    }
+  } catch (e) {
+    console.warn('[db] 补齐默认基准指数失败(可忽略):', e.message);
   }
   // Phase 3: 离线回填 fund.type。对"type 为空且 name 非空"的基金, 按名称关键词分类。
   // 在线刷新(fundInfo.getFundBase 返回东财 fundtype)为权威来源, 此处仅作离线兜底。

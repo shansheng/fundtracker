@@ -13,6 +13,7 @@
 // Node 18+ 内置 fetch
 
 const { getDb } = require('../db/db');
+const { mapLimit } = require('./concurrency');
 
 const SINA_URL = 'https://hq.sinajs.cn/list=';
 const EM_BASE = 'https://push2.eastmoney.com/api/qt/stock/get';
@@ -88,16 +89,47 @@ function toSecid(code) {
   return `${m}.${num}`;
 }
 
+// 新浪行情接口有两个坑:
+//   1) 同一 list 请求里混用 A 股(sh/sz/bj) 与 港股/美股(hk/gb) 代码时, 接口直接返回空(只给 1 条甚至 0 条)。
+//   2) 单请求 list= 的代码数/URL 长度有隐性上限: 一次塞 600+ 代码会直接返回空
+//      (实测 611 个 A 股代码单请求返回 0 条, 全部缺失 -> 估值系统性归零)。
+// 因此: 先按市场拆成 A 股组 / 港股美股组, 再在每个组内按 SINA_CHUNK 切成小块, 限并发抓取后合并。
+const SINA_CHUNK = 50;        // 每块代码数(规避新浪单请求数量/URL 长度上限)
+const SINA_CONCURRENCY = 3;   // 同时进行的块请求数(避免一次性十几个并行触发限流)
+const EM_CONCURRENCY = 5;     // 东方财富回退并发数(顺序逐只太慢)
+
 async function fetchFromSina(codes) {
-  const list = codes.map(normalizeCode).join(',');
+  const aShare = [];
+  const hkGb = [];
+  for (const c of codes) {
+    const n = normalizeCode(c);
+    if (/^(hk|gb)/i.test(n)) hkGb.push(n);
+    else aShare.push(n); // sh/sz/bj 及其它统一走 A 股通道
+  }
+  const out = {};
+  // 按市场组分别切成 SINA_CHUNK 大小的块
+  const chunks = [];
+  const pushChunks = (arr) => {
+    for (let i = 0; i < arr.length; i += SINA_CHUNK) chunks.push(arr.slice(i, i + SINA_CHUNK));
+  };
+  pushChunks(aShare);
+  pushChunks(hkGb);
+  // 限并发抓取(失败块静默, 缺失部分由 getRealtimeQuotes 后续走东方财富回退补)
+  await mapLimit(chunks, SINA_CONCURRENCY, (chunk) => fetchSinaOnce(chunk, out));
+  return out;
+}
+
+// 单次新浪批量请求(单一市场一组), 解析后写入 out。带 8s 超时, 避免接口无响应时无限挂起。
+async function fetchSinaOnce(codes, out) {
+  const list = codes.join(',');
   const res = await fetch(SINA_URL + list, {
     headers: { Referer: 'https://finance.sina.com.cn' },
+    signal: AbortSignal.timeout(8000),
   });
   // 新浪行情接口返回 GBK 编码(非 UTF-8)。Node 内置 TextDecoder 原生支持 'gbk',
   // 用 arrayBuffer + GBK 解码可正确还原中文名(否则 stock_quote.name 与估值明细股票名会乱码)。
   const buf = await res.arrayBuffer();
   const text = new TextDecoder('gbk').decode(buf);
-  const out = {};
   const re = /var hq_str_(\w+)="([^"]*)";/g;
   let m;
   while ((m = re.exec(text)) !== null) {
@@ -138,24 +170,26 @@ async function fetchFromSina(codes) {
       updated_at: new Date().toISOString(),
     };
   }
-  return out;
 }
 
 async function fetchFromEastmoney(codes) {
   const out = {};
-  for (const code of codes) {
-    if (/^(hk|gb)/i.test(code)) continue; // 港股/美股由新浪覆盖, 东方财富对应 secid 不稳定
+  const results = await mapLimit(codes, EM_CONCURRENCY, async (code) => {
+    if (/^(hk|gb)/i.test(code)) return null; // 港股/美股由新浪覆盖, 东方财富对应 secid 不稳定
     const secid = toSecid(code);
     const url = `${EM_BASE}?secid=${secid}&fields=f43,f44,f45,f46,f48,f57,f58,f60,f86&invt=2&fltt=2`;
     try {
-      const res = await fetch(url, { headers: { Referer: 'https://quote.eastmoney.com' } });
+      const res = await fetch(url, {
+        headers: { Referer: 'https://quote.eastmoney.com' },
+        signal: AbortSignal.timeout(8000),
+      });
       const json = await res.json();
       const d = json && json.data;
-      if (!d || d.f43 == null) continue;
+      if (!d || d.f43 == null) return null;
       const prevClose = d.f60;
       const price = d.f43;
       const pct = prevClose ? ((price - prevClose) / prevClose) * 100 : 0;
-      out[normalizeCode(code)] = {
+      return {
         stock_code: normalizeCode(code),
         name: d.f58,
         price,
@@ -163,9 +197,10 @@ async function fetchFromEastmoney(codes) {
         updated_at: new Date().toISOString(),
       };
     } catch (e) {
-      // 单只失败忽略
+      return null; // 单只失败忽略
     }
-  }
+  });
+  for (const r of results) if (r) out[r.stock_code] = r;
   return out;
 }
 
@@ -200,12 +235,18 @@ async function getRealtimeQuotes(codes) {
     } catch (e) {
       console.warn('新浪接口失败，回退东方财富', e.message);
     }
-    // 补充新浪未覆盖部分(如东财专属 A 股代码)
+    // 补充新浪未覆盖部分(如东财专属 A 股代码)。只有当新浪"大面积失败"(缺失超过半数)时才跳过东财回退,
+    // 避免高频打公共接口被限流; 正常的少量缺口(通常几十个)应交给东财补, 否则这些基金会缺估值。
     const miss2 = missing.filter((c) => !fetched[normalizeCode(c)]);
     if (miss2.length) {
-      networkCalls += 1; // 计一次东方财富批量请求
-      const em = await fetchFromEastmoney(miss2);
-      Object.assign(fetched, em);
+      const catastrophic = miss2.length > missing.length * 0.5;
+      if (catastrophic) {
+        console.warn(`新浪缺失 ${miss2.length}/${missing.length} 个代码(超半数), 跳过东方财富回退(避免限流)`);
+      } else {
+        networkCalls += 1; // 计一次东方财富批量请求
+        const em = await fetchFromEastmoney(miss2);
+        Object.assign(fetched, em);
+      }
     }
     for (const c of missing) {
       const key = normalizeCode(c);
@@ -226,4 +267,4 @@ function getQuoteStats() {
   return { networkCalls, cacheSize: memCache.size, ttlMs: QUOTE_TTL_MS };
 }
 
-module.exports = { getRealtimeQuotes, normalizeCode, toSecid, getQuoteStats };
+module.exports = { getRealtimeQuotes, normalizeCode, toSecid, getQuoteStats, fetchFromSina };

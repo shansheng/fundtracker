@@ -7,6 +7,7 @@ node_modules/
 *.db
 *.db-journal
 fundtracker.sqlite
+*.sqlite.bak.*     # sqlite 备份（含个人持仓/交易，禁止提交）
 
 # ── OCR 语言包（tesseract.js 首次运行自动下载） ───────
 *.traineddata
